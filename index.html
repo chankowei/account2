@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>部門損益實績分析系統</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -438,8 +438,8 @@ function parseJournal(data, totalInventory) {
 
   function getDept(summary) {
     const s = String(summary || '').trim();
-    if (/銷貨成本[-－]\d{4}|油品銷貨成本[-－]\d{4}/.test(s)) return 'M100';
-    if (/進貨結轉[-－]\d{4}|油品進貨結轉[-－]\d{4}|進貨退出結轉[-－]\d{4}/.test(s)) return 'SKIP';
+    // 銷貨成本結轉、進貨結轉 → SKIP（月底對沖分錄）
+    if (/^(銷貨成本|油品銷貨成本|進貨結轉|油品進貨結轉|進貨退出結轉)[-－]\d{4}$/.test(s)) return 'SKIP';
     if (s.length >= 4 && validDepts.has(s.slice(0,4))) return s.slice(0,4);
     const m = s.match(/\b([A-Z]\d{3})\b/);
     if (m && validDepts.has(m[1])) return m[1];
@@ -474,13 +474,25 @@ function parseJournal(data, totalInventory) {
   const inventory = {}; const cogsAdj = {};
   DEPTS.forEach(d => {
     if (d === 'G100') return;
+    // 先計算 cogsAdj（5150），再算期末存貨
+    const adj_5150 = nd(d,'5150');
+    cogsAdj[d] = adj_5150;
+    
+    // 情況A：有進貨 → 期末 = 銷貨收入淨額 - (進貨 - 退出 - 調整)
+    //   調整要取反號：nd('5150')=-1,722,864 → 在公式中用 -adj_5150 = +1,722,864
     if (gd(d,'5100') > 0) {
-      inventory[d] = nc(d,'4100') + nc(d,'4110') - gd(d,'5100') + nc(d,'5110');
-      cogsAdj[d] = 0;
-    } else if (nd(d,'5150') > 0) {
-      inventory[d] = nd(d,'5150'); cogsAdj[d] = nd(d,'5150');
-    } else {
-      inventory[d] = 0; cogsAdj[d] = 0;
+      const revNet = nc(d,'4100') + nc(d,'4110');
+      const purch = gd(d,'5100');
+      const ret = nc(d,'5110');
+      inventory[d] = revNet - (purch - ret - adj_5150);
+    } 
+    // 情況B：無進貨但有5150 → 期末=5150，調整=5150（互抵）
+    else if (adj_5150 !== 0) {
+      inventory[d] = adj_5150;
+    } 
+    // 情況C：無進貨無5150
+    else {
+      inventory[d] = 0;
     }
   });
   const othersSum = DEPTS.filter(d=>d!=='G100').reduce((s,d)=>s+(inventory[d]||0),0);
@@ -520,6 +532,7 @@ function parseJournal(data, totalInventory) {
     const costSalaries=costSalaryDispatch+costSalaryHour+costSalaryOT+costSalaryLabor+
       costSalaryHealth+costSalaryGroup+costSalaryRetire+costSalaryMeal+costSalaryBonus;
     const costOther=nd(dept,'5101099');
+    const cogsAdj_val = cogsAdj[dept]||0;
     const cogsVal=invBegin+purchase+purchaseReturn+invEnd+costPack+costFreight+
       costBonusFam+costBonusLf+costBonusOK+costBonusOther+
       costSalaryDispatch+costSalaryHour+costSalaryOT+costSalaryLabor+
@@ -604,7 +617,9 @@ function runAnalysis() {
     } catch(err) {
       setProgress(false);
       showToast('❌ 分析失敗：' + err.message);
-      console.error(err);
+      console.error('完整錯誤:', err);
+      console.error('錯誤堆疊:', err.stack);
+      alert('分析失敗！請按F12開啟開發者工具查看Console錯誤訊息。\n\n錯誤：' + err.message + '\n\n堆疊：' + (err.stack||'無'));
     }
   };
   reader.readAsArrayBuffer(file);
@@ -1074,6 +1089,30 @@ function downloadExcel() {
   XLSX.utils.book_append_sheet(wb, ws1, '📊彙整損益表');
 
   // ════════════════════════════════
+  // 工作表2：輸入至系統（科目欄頭、部門列）
+  // ════════════════════════════════
+  // 輸入至系統：只取有科目代號的項目，依代號排序
+  const ACCT_DEF_SORTED = [...ACCT_DEF]
+    .filter(([acct]) => acct !== null)
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  const sys_hdr = ['部門代號','部門名稱', ...ACCT_DEF_SORTED.map(([acct,label])=> acct+' '+label)];
+  const aoa_sys = [
+    [`${reportMonth} 各部門損益彙整表（輸入格式）`],
+    ['單位：新台幣元'],
+    sys_hdr,
+  ];
+  DEPTS.forEach(dept => {
+    const row_sys = [dept, DEPT_NAMES[dept]||dept, ...ACCT_DEF_SORTED.map(([acct,label,cat,sub,fn]) => fn(dept))];
+    aoa_sys.push(row_sys);
+  });
+  // 全公司合計列
+  const total_sys = ['合計', '全公司', ...ACCT_DEF_SORTED.map(([acct,label,cat,sub,fn]) => DEPTS.reduce((s,d)=>s+fn(d),0))];
+  aoa_sys.push(total_sys);
+  const ws_sys = XLSX.utils.aoa_to_sheet(aoa_sys);
+  ws_sys['!cols'] = [{wch:10},{wch:14}, ...ACCT_DEF_SORTED.map(()=>({wch:14}))];
+  XLSX.utils.book_append_sheet(wb, ws_sys, '📥輸入至系統');
+
+  // ════════════════════════════════
   // 工作表2：明細流水格式（部門|科目代號|科目名稱|類別|小類|金額）
   // 方便串接實績系統（Long format）
   // ════════════════════════════════
@@ -1094,7 +1133,7 @@ function downloadExcel() {
   // ════════════════════════════════
   // 工作表3：彙整分類帳
   // ════════════════════════════════
-  const lgHdr = ['部門','日期','傳票號碼','科目代號','科目名稱','客供商代號','摘要','借方金額','貸方金額','借方合計','貸方合計','差額'];
+  const lgHdr = ['部門','日期','傳票號碼','科目代號','科目名稱','客供商代號','摘要','借方','貸方','差額'];
   const aoa3 = [lgHdr];
   DEPTS.forEach(dept => {
     Object.keys(acctData[dept]||{}).sort().forEach(acct => {
@@ -1106,13 +1145,13 @@ function downloadExcel() {
         td+=d; tc+=c;
         aoa3.push([dept, String(row[COL.date]||''), String(row[COL.voucher]||''),
           acct, acctNames[acct]||'', String(row[COL.vendor]||''), String(row[COL.summary]||''),
-          d||'', c||'', '', '', '']);
+          d||'', c||'', '']);
       });
-      aoa3.push([dept,'','',acct,(acctNames[acct]||'')+'【小計】','','','','',td,tc,td-tc]);
+      { const diff = /^[47]/.test(acct) ? tc-td : td-tc; aoa3.push([dept,'','',acct,'★'+(acctNames[acct]||'')+'【小計】','','',td,tc,diff]); }
     });
   });
   const ws3 = XLSX.utils.aoa_to_sheet(aoa3);
-  ws3['!cols'] = [{wch:8},{wch:12},{wch:15},{wch:10},{wch:22},{wch:12},{wch:40},{wch:14},{wch:14},{wch:14},{wch:14},{wch:14}];
+  ws3['!cols'] = [{wch:8},{wch:12},{wch:15},{wch:10},{wch:22},{wch:12},{wch:40},{wch:14},{wch:14},{wch:14}];
   XLSX.utils.book_append_sheet(wb, ws3, '📋彙整分類帳');
 
   // ════════════════════════════════
@@ -1133,7 +1172,7 @@ function downloadExcel() {
     XLSX.utils.book_append_sheet(wb, wsPL, `損益_${dept}`);
 
     // 分類帳
-    const lgRows = [['日期','傳票號碼','科目代號','科目名稱','客供商代號','摘要','借方金額','貸方金額','借方合計','貸方合計','差額']];
+    const lgRows = [['日期','傳票號碼','科目代號','科目名稱','客供商代號','摘要','借方','貸方','差額']];
     Object.keys(acctData[dept]||{}).sort().forEach(acct => {
       const deptRows = (ledgerRows[dept]?.[acct]||[]).sort((a,b)=>String(a[COL.date]).localeCompare(String(b[COL.date])));
       if (!deptRows.length) return;
@@ -1143,16 +1182,75 @@ function downloadExcel() {
         td+=d; tc+=c;
         lgRows.push([String(row[COL.date]||''), String(row[COL.voucher]||''),
           acct, acctNames[acct]||'', String(row[COL.vendor]||''), String(row[COL.summary]||''),
-          d||'', c||'', '', '', '']);
+          d||'', c||'', '']);
       });
-      lgRows.push(['','',acct,(acctNames[acct]||'')+'【小計】','','','','',td,tc,td-tc]);
+      { const diff = /^[47]/.test(acct) ? tc-td : td-tc; lgRows.push(['','',acct,'★'+(acctNames[acct]||'')+'【小計】','','',td,tc,diff]); }
     });
     const wsLG = XLSX.utils.aoa_to_sheet(lgRows);
-    wsLG['!cols'] = [{wch:12},{wch:15},{wch:10},{wch:22},{wch:12},{wch:40},{wch:14},{wch:14},{wch:14},{wch:14},{wch:14}];
+    wsLG['!cols'] = [{wch:12},{wch:15},{wch:10},{wch:22},{wch:12},{wch:40},{wch:14},{wch:14},{wch:14}];
     XLSX.utils.book_append_sheet(wb, wsLG, `分類帳_${dept}`);
   });
 
-  const fname = (reportMonth||'本期') + '_各部門損益彙整.xlsx';
+
+  // ════════════════════════════════
+  // 套用格式：千分位(cell.z) + 小計行標記
+  // ════════════════════════════════
+  const NUM_FMT = '#,##0;(#,##0);-';
+
+  const YELLOW_FILL = { patternType: 'solid', fgColor: { rgb: 'FFFF99' } };
+
+  function applyNumFmt(sheet, numColStart, numColEnd, highlightKeyword) {
+    if (!sheet['!ref']) return;
+    const range = XLSX.utils.decode_range(sheet['!ref']);
+    for (let R = range.s.r; R <= range.e.r; R++) {
+      // 判斷是否為小計行
+      let isSubtotal = false;
+      if (highlightKeyword) {
+        for (let C = range.s.c; C <= range.e.c; C++) {
+          const cell = sheet[XLSX.utils.encode_cell({r:R,c:C})];
+          if (cell && typeof cell.v === 'string' && cell.v.includes(highlightKeyword)) {
+            isSubtotal = true; break;
+          }
+        }
+      }
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const addr = XLSX.utils.encode_cell({r:R, c:C});
+        let cell = sheet[addr];
+        if (!cell && isSubtotal) {
+          cell = {t:'z', v:''};
+          sheet[addr] = cell;
+        }
+        if (!cell) continue;
+        if (!cell.s) cell.s = {};
+        // 小計行整列黃底
+        if (isSubtotal) {
+          cell.s.fill = YELLOW_FILL;
+        }
+        // 數字欄千分位
+        if (C >= numColStart && C <= numColEnd && typeof cell.v === 'number') {
+          cell.z = NUM_FMT;
+          cell.s.numFmt = NUM_FMT;
+          cell.t = 'n';
+          if (isSubtotal) cell.s.fill = YELLOW_FILL;
+        }
+      }
+    }
+  }
+
+  // 彙整損益表
+  applyNumFmt(ws1, 2, 999);
+  // 輸入至系統
+  applyNumFmt(ws_sys, 2, 999);
+  // 明細流水格式
+  applyNumFmt(ws2, 7, 7);
+  // 彙整分類帳：借方(7)~差額(11)，★小計行黃底
+  applyNumFmt(ws3, 7, 8, '★');
+  // 各部門損益表
+  wb.SheetNames.filter(n => n.startsWith('損益_')).forEach(n => applyNumFmt(wb.Sheets[n], 2, 2));
+  // 各部門分類帳：借方(6)~差額(10)，★小計行黃底
+  wb.SheetNames.filter(n => n.startsWith('分類帳_')).forEach(n => applyNumFmt(wb.Sheets[n], 6, 8, '★'));
+
+    const fname = (reportMonth||'本期') + '_各部門損益彙整.xlsx';
   XLSX.writeFile(wb, fname);
   showToast('⬇ 已下載：' + fname);
 }
